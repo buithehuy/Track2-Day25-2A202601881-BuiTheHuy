@@ -6,6 +6,15 @@ live prices as fast-moving (re-baseline before each cohort).
 from __future__ import annotations
 
 
+# Illustrative interruption rates for the June-2026 snapshot.  Keeping this
+# policy data here makes the purchasing recommendation explainable and easy to
+# replace with provider telemetry.
+SPOT_INTERRUPTION_RATE = {
+    "H100": 0.05, "H200": 0.06, "A100": 0.08, "A10G": 0.12,
+    "L4": 0.10, "B200": 0.07, "MI300X": 0.09,
+}
+
+
 def request_cost(
     input_tok: int,
     output_tok: int,
@@ -52,6 +61,22 @@ def discount_stack(
     return cache_mult * batch_mult
 
 
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+) -> bool:
+    """Return whether repeated reads recover the one-time cache-write cost.
+
+    In this simple per-million-token model, each read saves ``1-read_discount``
+    dollars relative to an uncached read.  The caller can pass the relevant
+    input price separately by scaling ``write_cost_per_m`` accordingly.
+    """
+    if avg_cache_reads <= 0 or write_cost_per_m < 0:
+        return False
+    return avg_cache_reads * (1.0 - read_discount) > write_cost_per_m
+
+
 def break_even_utilization(discount_frac: float) -> float:
     """Utilization at which a commitment pays off ~= 1 - discount.
 
@@ -60,19 +85,27 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: float | None = None,
+) -> str:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
-      - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
-      - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
-      - otherwise                 -> 'on_demand' (spiky / low duty)
+    Policy extension: spot is selected only when the workload is interruptible
+    and the GPU's expected interruption rate is manageable.  A short-lived
+    commitment is also kept on-demand because a 1yr/3yr reservation cannot be
+    amortized safely.  The optional arguments preserve the original API.
     """
     duty = max(0.0, hours_per_day) / 24.0
     be = break_even_utilization(reserved_discount)
-    if interruptible and hours_per_day < 24:
+    interruption = SPOT_INTERRUPTION_RATE.get(gpu_type, 0.08)
+    if interruptible and hours_per_day < 24 and interruption <= 0.12:
         return "spot"
-    if duty >= be:
+    commitment_days = 30.0 if job_days is None else max(0.0, job_days)
+    if duty >= be and commitment_days >= 30:
         return "reserved"
     return "on_demand"
 
