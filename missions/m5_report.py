@@ -46,13 +46,66 @@ def run(verbose: bool = True) -> dict:
     # --- sustainability snapshot ---
     median_tokens = 800
     wh = sustainability.wh_per_query(median_tokens)
+    cleanest = min(sustainability.REGION_CARBON, key=sustainability.REGION_CARBON.get)
+    cheapest = min(sustainability.REGION_PRICE_KWH, key=sustainability.REGION_PRICE_KWH.get)
     sust = {
         "wh_per_query": wh,
         "carbon_g": sustainability.carbon_g(wh, "us-east-1"),
-        "best_region": min(sustainability.REGION_CARBON, key=sustainability.REGION_CARBON.get),
+        "best_region": cleanest, "best_region_carbon": sustainability.REGION_CARBON[cleanest],
+        "cheapest_region": cheapest, "cheapest_region_price": sustainability.REGION_PRICE_KWH[cheapest],
+        "reasoning_cost": r2["reasoning_cost"],
+        "reasoning_pct_traffic": r2["reasoning_pct_traffic"],
+        "reasoning_cost_pct": r2["reasoning_cost_pct"],
+        "optimized_wh": r2["optimized_wh"], "capped_wh": r2["capped_wh"],
+        "capped_cost": r2["capped_cost"],
     }
 
-    md = report.build_report(baseline, optimized, levers, sustainability=sust)
+    md = report.build_report(baseline, optimized, levers, sustainability=sust,
+                             baseline_per_m=r2["baseline_per_m"], optimized_per_m=r2["optimized_per_m"])
+    right_lines = [
+        "",
+        "## Technical analysis and extensions",
+        "",
+        "### Why GPU-Util lies",
+        "",
+        "`gpu-h100-4` reports ~98% GPU-Util but only ~0.19 MFU. GPU-Util measures "
+        "whether kernels/clock activity are present, not useful FLOPs completed. "
+        "Memory stalls, small kernel launches, synchronization, or I/O can keep the "
+        "device busy while producing little computation; the full GPU-hour is still billed.",
+        "",
+        "### Extension 1 — interruption- and duration-aware purchasing",
+        "",
+        "The policy uses per-GPU spot interruption rates (5–12%), keeps interruptible "
+        "jobs on spot when checkpointable, and requires a 30-day minimum before a "
+        "reserved recommendation. This avoids reserving short-lived capacity; the "
+        f"dataset changes the purchasing result to {r3['savings_pct']:.1f}% monthly savings "
+        "versus on-demand. Re-evaluate rates and 1yr/3yr terms with live provider data.",
+        "",
+        "### Extension 2 — MBU-aware right-sizing",
+        "",
+        "Candidates must meet observed bandwidth plus 10% headroom and then minimize "
+        "HBM footprint before comparing $/GB-VRAM. This prevents choosing the cheapest "
+        "hourly GPU that cannot sustain the workload's memory traffic. See M1 output "
+        "for the per-GPU recommendation and hourly saving.",
+        "",
+        "### Extension 4 — reasoning budget",
+        "",
+        f"Reasoning is {r2['reasoning_pct_traffic']:.1f}% of requests but {r2['reasoning_cost_pct']:.1f}% "
+        f"of optimized inference cost (${r2['reasoning_cost']:.2f}/day). It consumes "
+        f"{r2['optimized_wh']:,.0f} Wh/day in the model. The observed traffic is already "
+        f"below the 10% cap ({r2['capped_reasoning_requests']} requests would be capped), "
+        "so the measured cap produces no further reduction; route new reasoning traffic "
+        "only for high-complexity tasks and alert when its share exceeds 10%.",
+        "",
+        "### Action priority",
+        "",
+        "1. Apply cascade, cache, and batch policies first: they reduce the inference "
+        f"unit cost from ${r2['baseline_per_m']:.3f} to ${r2['optimized_per_m']:.3f}/1M-token.\n"
+        "2. Stop idle GPUs and remediate low-MFU util-lies.\n"
+        "3. Use spot with checkpoints for interruptible jobs; reserve only stable capacity.\n"
+        "4. Shift flexible workloads to the cleanest region after checking latency and data residency.",
+    ]
+    md += "\n".join(right_lines) + "\n"
     out_md = os.path.join(ROOT, "outputs", "report.md")
     os.makedirs(os.path.dirname(out_md), exist_ok=True)
     with open(out_md, "w") as f:
